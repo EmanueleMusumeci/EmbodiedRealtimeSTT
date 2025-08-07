@@ -703,6 +703,11 @@ class AudioToTextRecorder:
         self.accumulated_audio_clip = []  # Buffer for accumulated audio for clips
         self.recording_start_timestamp = None  # When current recording started
         
+        # Track transcription history for saving with audio clips
+        self.partial_transcriptions_history = []  # List of (timestamp, language_transcriptions_dict, selected_language, selected_text)
+        self.final_transcription = ""  # Final transcription result
+        self.final_detected_language = ""  # Final detected language
+        
         # Initialize language-specific data structures
         for lang in self.languages:
             self.language_transcriptions[lang] = ""
@@ -1590,6 +1595,28 @@ class AudioToTextRecorder:
                     self.last_transcription_bytes = copy.deepcopy(audio_bytes)
                     self.last_transcription_bytes_b64 = base64.b64encode(self.last_transcription_bytes.tobytes()).decode('utf-8')
                     transcription = self._preprocess_output(segments)
+                    
+                    # Track final transcription for audio clip saving
+                    if transcription and not self.interrupt_stop_event.is_set():
+                        self.final_transcription = transcription.strip()
+                        self.final_detected_language = self.detected_language or "unknown"
+                        logger.debug(f"Final transcription captured: {self.final_transcription} (language: {self.final_detected_language})")
+                        
+                        # Print transcription with language probabilities
+                        if hasattr(self, 'language_probabilities') and self.language_probabilities:
+                            # Print final transcription with language probabilities highlighted
+                            prob_display = self._format_language_probabilities(
+                                self.language_probabilities, 
+                                self.final_detected_language
+                            )
+                            print(f"\nTranscription: {self.final_transcription}")
+                            print(f"Language Probabilities: {prob_display}")
+                        else:
+                            # Fallback for single-language mode
+                            print(f"\nTranscription: {self.final_transcription}")
+                            if self.detected_language and self.detected_language_probability > 0:
+                                print(f"Language: \033[1m{self.detected_language}: {self.detected_language_probability:.3f}\033[0m")
+                    
                     end_time = time.time()  # End timing
                     transcription_time = end_time - start_time
 
@@ -1762,6 +1789,12 @@ class AudioToTextRecorder:
         if frames:
             self.frames = frames
         self.is_recording = True
+
+        # Reset transcription tracking for audio clip saving
+        self.partial_transcriptions_history = []
+        self.final_transcription = ""
+        self.final_detected_language = ""
+        self.recording_start_timestamp = time.time()
 
         self.recording_start_time = time.time()
         self.is_silero_speech_active = False
@@ -2488,7 +2521,36 @@ class AudioToTextRecorder:
                         self.detected_realtime_language = best_language
                         self.detected_realtime_language_probability = best_probability
                         
+                        # Track partial transcription for saving with audio clip
+                        # Only track if we have meaningful transcription changes
+                        if best_text.strip() and (not self.partial_transcriptions_history or 
+                                                 self.partial_transcriptions_history[-1][3] != best_text.strip()):
+                            timestamp = time.time()
+                            # Store a copy of current language transcriptions and probabilities
+                            transcriptions_snapshot = self.language_transcriptions.copy()
+                            probabilities_snapshot = self.language_probabilities.copy()
+                            self.partial_transcriptions_history.append((
+                                timestamp, 
+                                transcriptions_snapshot, 
+                                probabilities_snapshot,
+                                best_language, 
+                                best_text.strip()
+                            ))
+                        
                         logger.debug(f"Best language: {best_language} (prob: {best_probability:.3f}) - Text: {best_text}")
+                        
+                        # Print realtime language probabilities (only if significantly different from last)
+                        if (best_text.strip() and len(self.languages) > 1 and 
+                            hasattr(self, '_last_printed_realtime_probs') and
+                            time.time() - getattr(self, '_last_printed_realtime_probs', 0) > 2.0):  # Print at most every 2 seconds
+                            
+                            prob_display = self._format_language_probabilities(
+                                self.language_probabilities, 
+                                best_language
+                            )
+                            print(f"\n[Realtime] {best_text}")
+                            print(f"[Realtime] Language Probabilities: {prob_display}")
+                            self._last_printed_realtime_probs = time.time()
                     else:
                         best_text = ""
                         best_language = self.languages[0] if self.languages else "en"
@@ -2709,7 +2771,9 @@ class AudioToTextRecorder:
     
     def _save_audio_clip(self):
         """
-        Save the accumulated audio clip to the specified directory.
+        Save the accumulated audio clip and transcription information to the specified directory.
+        Creates filenames with recognized words and logs to daily recognition log.
+        Robust to exceptions - will not crash the server if saving fails.
         """
         if not self.audio_clips_dir or not self.accumulated_audio_clip:
             return
@@ -2718,20 +2782,165 @@ class AudioToTextRecorder:
             # Create directory if it doesn't exist
             os.makedirs(self.audio_clips_dir, exist_ok=True)
             
-            # Generate filename with timestamp
+            # Extract words from final transcription for filename
+            words_part = ""
+            if self.final_transcription:
+                # Clean and split the transcription into words
+                import re
+                words = re.findall(r'\b\w+\b', self.final_transcription.lower())
+                words = [word for word in words if len(word) > 1]  # Filter out single characters
+                
+                if len(words) >= 4:
+                    # Take first two and last two words
+                    words_part = f"_{words[0]}_{words[1]}_{words[-2]}_{words[-1]}"
+                elif len(words) >= 2:
+                    # Take all available words
+                    words_part = f"_{'_'.join(words)}"
+                elif len(words) == 1:
+                    words_part = f"_{words[0]}"
+                
+                # Limit length and ensure safe filename
+                words_part = words_part[:50]  # Limit total length
+                words_part = re.sub(r'[^\w_-]', '', words_part)  # Remove unsafe characters
+            
+            # Generate filename with timestamp and words
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            filename = f"audio_clip_{timestamp}.wav"
-            filepath = os.path.join(self.audio_clips_dir, filename)
+            base_filename = f"audio_clip_{timestamp}{words_part}"
+            audio_filepath = os.path.join(self.audio_clips_dir, f"{base_filename}.wav")
+            text_filepath = os.path.join(self.audio_clips_dir, f"{base_filename}.txt")
             
-            # Convert to numpy array and save
+            # Convert to numpy array and save audio
             audio_data = np.array(self.accumulated_audio_clip, dtype=np.float32)
-            sf.write(filepath, audio_data, SAMPLE_RATE)
+            sf.write(audio_filepath, audio_data, SAMPLE_RATE)
             
-            logger.debug(f"Saved audio clip: {filepath} ({len(audio_data)/SAMPLE_RATE:.2f}s)")
+            # Calculate duration
+            duration = len(audio_data) / SAMPLE_RATE
+            
+            # Create/update daily recognition log
+            self._log_to_recognition_log(base_filename, duration, self.final_transcription, self.final_detected_language)
+            
+            # Save transcription information to text file
+            with open(text_filepath, 'w', encoding='utf-8') as f:
+                f.write(f"Audio Clip: {base_filename}.wav\n")
+                f.write(f"Duration: {duration:.2f} seconds\n")
+                f.write(f"Recording Start: {datetime.datetime.fromtimestamp(self.recording_start_timestamp).strftime('%Y-%m-%d %H:%M:%S') if self.recording_start_timestamp else 'Unknown'}\n")
+                f.write(f"Sample Rate: {SAMPLE_RATE} Hz\n")
+                f.write("=" * 50 + "\n\n")
+                
+                # Write partial transcriptions
+                f.write("PARTIAL TRANSCRIPTIONS:\n")
+                f.write("-" * 30 + "\n")
+                if self.partial_transcriptions_history:
+                    for i, (ts, transcriptions, probabilities, selected_lang, selected_text) in enumerate(self.partial_transcriptions_history):
+                        relative_time = ts - self.recording_start_timestamp if self.recording_start_timestamp else ts
+                        f.write(f"\n[{relative_time:.2f}s] Update #{i+1}:\n")
+                        f.write(f"Selected Language: {selected_lang}\n")
+                        f.write(f"Selected Text: {selected_text}\n")
+                        f.write("Language-specific transcriptions:\n")
+                        for lang, text in transcriptions.items():
+                            prob = probabilities.get(lang, 0.0)
+                            f.write(f"  {lang}: {text} (probability: {prob:.3f})\n")
+                        f.write("\n")
+                else:
+                    f.write("No partial transcriptions recorded.\n\n")
+                
+                # Write final transcription
+                f.write("FINAL TRANSCRIPTION:\n")
+                f.write("-" * 30 + "\n")
+                f.write(f"Language: {self.final_detected_language or 'Unknown'}\n")
+                f.write(f"Text: {self.final_transcription or 'No final transcription available'}\n")
+                
+                # Write language probability summary
+                if hasattr(self, 'language_probabilities') and self.language_probabilities:
+                    f.write(f"\nFINAL LANGUAGE PROBABILITIES:\n")
+                    f.write("-" * 30 + "\n")
+                    sorted_langs = sorted(self.language_probabilities.items(), key=lambda x: x[1], reverse=True)
+                    for lang, prob in sorted_langs:
+                        f.write(f"{lang}: {prob:.3f}\n")
+            
+            logger.debug(f"Saved audio clip: {audio_filepath} ({duration:.2f}s)")
+            logger.debug(f"Saved transcription info: {text_filepath}")
             
         except Exception as e:
-            logger.error(f"Error saving audio clip: {e}")
-            raise
+            logger.error(f"Error saving audio clip and transcription: {e}")
+            # Don't re-raise the exception to prevent server crashes
+            # Just log the error and continue
+
+    def _log_to_recognition_log(self, clip_filename, duration, transcription, language):
+        """
+        Log clip information to daily recognition log file.
+        Creates a new log file each day.
+        Robust to exceptions - will not crash if logging fails.
+        """
+        if not self.audio_clips_dir:
+            return
+            
+        try:
+            # Generate log filename based on current date
+            current_date = datetime.datetime.now().strftime("%Y%m%d")
+            log_filename = f"recognition_{current_date}.log"
+            log_filepath = os.path.join(self.audio_clips_dir, log_filename)
+            
+            # Create log entry
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_entry = (
+                f"[{timestamp}] "
+                f"Clip: {clip_filename}.wav | "
+                f"Duration: {duration:.2f}s | "
+                f"Language: {language or 'Unknown'} | "
+                f"Text: {transcription or 'No transcription'}\n"
+            )
+            
+            # Check if this is a new log file (first entry of the day)
+            is_new_log = not os.path.exists(log_filepath)
+            
+            # Append to log file (create if doesn't exist)
+            with open(log_filepath, 'a', encoding='utf-8') as f:
+                if is_new_log:
+                    # Add header for new log file
+                    f.write(f"=== RealtimeSTT Recognition Log - {current_date} ===\n")
+                    f.write(f"Started: {timestamp}\n")
+                    f.write("=" * 80 + "\n\n")
+                
+                f.write(log_entry)
+            
+            logger.debug(f"Logged to recognition log: {log_filepath}")
+            
+        except Exception as e:
+            logger.error(f"Error writing to recognition log: {e}")
+            # Don't raise - logging failure shouldn't stop audio clip saving
+
+    def _format_language_probabilities(self, language_probabilities, selected_language=None):
+        """
+        Format language probabilities for display with the dominant language highlighted in bold.
+        
+        Args:
+            language_probabilities (dict): Dictionary of language codes to probabilities
+            selected_language (str): The selected/dominant language to highlight
+            
+        Returns:
+            str: Formatted string with language probabilities
+        """
+        if not language_probabilities:
+            return "No language probabilities available"
+            
+        # Sort languages by probability (highest first)
+        sorted_langs = sorted(language_probabilities.items(), key=lambda x: x[1], reverse=True)
+        
+        # Find the dominant language if not specified
+        if not selected_language and sorted_langs:
+            selected_language = sorted_langs[0][0]
+        
+        # Format each language probability
+        formatted_parts = []
+        for lang, prob in sorted_langs:
+            prob_str = f"{lang}: {prob:.3f}"
+            if lang == selected_language:
+                # Use ANSI escape codes for bold formatting
+                prob_str = f"\033[1m{prob_str}\033[0m"
+            formatted_parts.append(prob_str)
+        
+        return " | ".join(formatted_parts)
 
     def _is_silero_speech(self, chunk):
         """
