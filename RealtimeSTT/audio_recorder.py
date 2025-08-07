@@ -2427,6 +2427,14 @@ class AudioToTextRecorder:
 
         try:
             logger.debug('Starting multi-language realtime worker')
+            print(f"[MULTILANG] Realtime worker started for languages: {self.languages}")
+            print(f"[MULTILANG] Smoothing factor: {self.language_smoothing_factor}")
+            print(f"[MULTILANG] SpeechBrain available: {self.speechbrain_available}")
+            
+            # Initialize language probabilities to ensure they exist
+            for lang in self.languages:
+                if lang not in self.language_probabilities:
+                    self.language_probabilities[lang] = 0.0
 
             # Return immediately if real-time transcription is not enabled
             if not self.enable_realtime_transcription:
@@ -2482,33 +2490,69 @@ class AudioToTextRecorder:
                     # Parallel transcription for all languages
                     language_results = self._transcribe_parallel_languages(audio_array)
                     
-                    # Update language probabilities with smoothing
-                    for lang, (text, prob) in language_results.items():
-                        if lang in self.language_probabilities:
-                            # Apply exponential smoothing: new_prob = α * current + (1-α) * old
-                            self.language_probabilities[lang] = (
-                                self.language_smoothing_factor * prob + 
-                                (1 - self.language_smoothing_factor) * self.language_probabilities[lang]
-                            )
-                        else:
-                            self.language_probabilities[lang] = prob
-                        
-                        self.language_transcriptions[lang] = text
-
-                    # Perform SpeechBrain evaluation if available and interval passed
+                    # Debug output for what we got from transcription
+                    print(f"[MULTILANG] Transcription results: {[(lang, text[:30]+'...' if len(text) > 30 else text) for lang, (text, prob) in language_results.items()]}")
+                    
+                    # Use SpeechBrain for language detection if available
                     current_time = time.time()
+                    speechbrain_detected_lang = None
                     if (self.speechbrain_available and 
                         current_time - self.last_speechbrain_eval >= self.speechbrain_evaluation_interval and
                         len(self.accumulated_audio_clip) >= int(3.0 * SAMPLE_RATE)):  # At least 3 seconds
                         
-                        speechbrain_bonus = self._evaluate_with_speechbrain()
-                        if speechbrain_bonus:
-                            # Apply SpeechBrain bonus to language probabilities
-                            for lang, bonus in speechbrain_bonus.items():
-                                if lang in self.language_probabilities:
-                                    self.language_probabilities[lang] += bonus
-                        
+                        speechbrain_detected_lang = self._evaluate_with_speechbrain()
                         self.last_speechbrain_eval = current_time
+                        
+                        if speechbrain_detected_lang:
+                            print(f"[SPEECHBRAIN] Detected language: {speechbrain_detected_lang}")
+                        else:
+                            print(f"[SPEECHBRAIN] No language detected or not enough audio data")
+                    else:
+                        if not self.speechbrain_available:
+                            print(f"[SPEECHBRAIN] SpeechBrain not available")
+                        elif len(self.accumulated_audio_clip) < int(3.0 * SAMPLE_RATE):
+                            print(f"[SPEECHBRAIN] Not enough audio data ({len(self.accumulated_audio_clip)}/{int(3.0 * SAMPLE_RATE)} samples)")
+                        else:
+                            print(f"[SPEECHBRAIN] Waiting for evaluation interval ({current_time - self.last_speechbrain_eval:.1f}s/{self.speechbrain_evaluation_interval}s)")
+                    
+                    # Update language probabilities based on SpeechBrain detection and smoothing
+                    for lang, (text, base_prob) in language_results.items():
+                        old_prob = self.language_probabilities.get(lang, 0.0)
+                        
+                        # Start with base probability from transcription quality/length
+                        new_prob = base_prob
+                        
+                        # Add significant boost if SpeechBrain detected this language
+                        if speechbrain_detected_lang == lang:
+                            new_prob += 0.7  # 70% boost for SpeechBrain match
+                            print(f"[SPEECHBRAIN] Boosting {lang} probability by 0.7")
+                        elif speechbrain_detected_lang and speechbrain_detected_lang != lang:
+                            new_prob *= 0.3  # Reduce non-matching languages
+                            
+                        # Apply exponential smoothing: new_prob = α * current + (1-α) * old
+                        if lang in self.language_probabilities:
+                            smoothed_prob = (
+                                self.language_smoothing_factor * new_prob + 
+                                (1 - self.language_smoothing_factor) * self.language_probabilities[lang]
+                            )
+                            self.language_probabilities[lang] = smoothed_prob
+                        else:
+                            self.language_probabilities[lang] = new_prob
+                            smoothed_prob = new_prob
+                        
+                        self.language_transcriptions[lang] = text
+                        
+                        # Debug output for probability updates
+                        logger.debug(f"Language {lang}: old_prob={old_prob:.3f}, base_prob={base_prob:.3f}, new_prob={new_prob:.3f}, smoothed={smoothed_prob:.3f}, text='{text.strip()}'")
+                        
+                        # Also print for visible debugging (can be removed later)
+                        if text.strip():  # Only print if there's actual text
+                            print(f"[LANG-DEBUG] {lang}: {old_prob:.3f} -> {smoothed_prob:.3f} | '{text.strip()}'", flush=True)
+
+                    # Print summary of current language probabilities
+                    if any(self.language_probabilities.values()):
+                        prob_summary = " | ".join([f"{lang}: {prob:.3f}" for lang, prob in sorted(self.language_probabilities.items(), key=lambda x: x[1], reverse=True)])
+                        print(f"[PROB-SUMMARY] {prob_summary}")
 
                     # Select the language with highest probability
                     if self.language_probabilities:
@@ -2541,7 +2585,6 @@ class AudioToTextRecorder:
                         
                         # Print realtime language probabilities (only if significantly different from last)
                         if (best_text.strip() and len(self.languages) > 1 and 
-                            hasattr(self, '_last_printed_realtime_probs') and
                             time.time() - getattr(self, '_last_printed_realtime_probs', 0) > 2.0):  # Print at most every 2 seconds
                             
                             prob_display = self._format_language_probabilities(
@@ -2717,10 +2760,26 @@ class AudioToTextRecorder:
                 )
 
             transcription = " ".join(seg.text for seg in segments)
-            probability = getattr(info, 'language_probability', 0.0)
             
-            logger.debug(f"Language {language}: {transcription} (prob: {probability:.3f})")
-            return transcription, probability
+            # Calculate a base probability based on transcription quality
+            # This gives us some differentiation between languages even without SpeechBrain
+            base_probability = 0.1  # Minimum base probability
+            
+            if transcription.strip():
+                # Add probability based on text length (longer text often means better detection)
+                text_length_bonus = min(0.3, len(transcription.strip()) / 100.0)  # Up to 30% for 100+ chars
+                
+                # Add probability based on presence of actual words (not just noise)
+                word_count = len(transcription.strip().split())
+                word_bonus = min(0.2, word_count / 10.0)  # Up to 20% for 10+ words
+                
+                base_probability += text_length_bonus + word_bonus
+            
+            # Cap at reasonable maximum
+            base_probability = min(0.6, base_probability)
+            
+            logger.debug(f"Language {language}: text='{transcription}' (base_prob: {base_probability:.3f})")
+            return transcription, base_probability
             
         except Exception as e:
             logger.error(f"Error in single language transcription for {language}: {e}")
@@ -2731,10 +2790,10 @@ class AudioToTextRecorder:
         Use SpeechBrain to evaluate the language of the last 3 seconds of audio.
         
         Returns:
-            Dict mapping language codes to bonus scores (0.0 to 0.1)
+            str: The detected language code, or None if detection failed
         """
         if not self.speechbrain_available or len(self.accumulated_audio_clip) < int(3.0 * SAMPLE_RATE):
-            return {}
+            return None
         
         try:
             # Get last 3 seconds of audio
@@ -2754,20 +2813,17 @@ class AudioToTextRecorder:
             
             mapped_lang = lang_mapping.get(predicted_lang, predicted_lang)
             
-            # Create bonus dictionary
-            bonus = {}
-            for lang in self.languages:
-                if lang == mapped_lang:
-                    bonus[lang] = 0.05  # 5% bonus for SpeechBrain match
-                else:
-                    bonus[lang] = 0.0
+            # Only return the language if it's one of our configured languages
+            if mapped_lang in self.languages:
+                logger.debug(f"SpeechBrain detected language: {predicted_lang} -> {mapped_lang}")
+                return mapped_lang
+            else:
+                logger.debug(f"SpeechBrain detected language {predicted_lang} -> {mapped_lang}, but not in configured languages {self.languages}")
+                return None
                     
-            logger.debug(f"SpeechBrain detected language: {predicted_lang} -> {mapped_lang}")
-            return bonus
-            
         except Exception as e:
             logger.error(f"Error in SpeechBrain evaluation: {e}")
-            return {}
+            return None
     
     def _save_audio_clip(self):
         """

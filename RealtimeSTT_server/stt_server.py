@@ -620,6 +620,12 @@ def parse_arguments():
     writechunks = args.write
     log_incoming_chunks = args.logchunks
     dynamic_silence_timing = args.silence_timing
+    
+    # Set logging level based on debug flag
+    if debug_logging:
+        loglevel = logging.DEBUG
+    else:
+        loglevel = logging.WARNING
 
 
     ws_logger = logging.getLogger('websockets')
