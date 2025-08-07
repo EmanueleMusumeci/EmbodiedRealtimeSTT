@@ -655,7 +655,8 @@ def _recorder_thread(loop):
     
     def recover_recorder():
         """Attempt to recover stuck recorder"""
-        nonlocal recorder, consecutive_failures
+        global recorder
+        nonlocal consecutive_failures
         print(f"{bcolors.WARNING}Attempting to recover recorder...{bcolors.ENDC}")
         
         try:
@@ -698,6 +699,7 @@ def _recorder_thread(loop):
                 continue
             
             # Submit transcription task with timeout
+            future = None
             try:
                 future = executor.submit(text_with_timeout)
                 success = future.result(timeout=transcription_timeout)
@@ -711,7 +713,11 @@ def _recorder_thread(loop):
                 consecutive_failures += 1
                 
                 # Cancel the future to prevent resource leaks
-                future.cancel()
+                if future:
+                    try:
+                        future.cancel()
+                    except:
+                        pass
                 
                 # Force recovery on timeout
                 if not recover_recorder():
