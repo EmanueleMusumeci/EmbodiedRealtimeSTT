@@ -664,6 +664,8 @@ def _recorder_thread(loop):
             if recorder:
                 recorder.abort()
                 recorder.clear_audio_queue()
+                recorder.shutdown()
+                print(f"{bcolors.OKGREEN}Recorder aborted and cleared{bcolors.ENDC}")
                 time.sleep(1.0)
                 
             # Reinitialize recorder
