@@ -27,11 +27,12 @@ Author: Kolja Beigel
 """
 
 from faster_whisper import WhisperModel, BatchedInferencePipeline
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, List, Optional, Union, Dict
 from openwakeword.model import Model
 import torch.multiprocessing as mp
 from scipy.signal import resample
 import signal as system_signal
+import concurrent.futures
 from ctypes import c_bool
 from scipy import signal
 from .safepipe import SafePipe
@@ -48,13 +49,17 @@ import datetime
 import platform
 import logging
 import struct
-import base64
-import queue
-import torch
-import halo
+import json
+import wave
 import time
 import copy
+import torch
+import queue
+import halo
+import math
 import os
+import base64
+import time
 import re
 import gc
 
@@ -277,6 +282,12 @@ class AudioToTextRecorder:
                  on_realtime_transcription_update=None,
                  on_realtime_transcription_stabilized=None,
                  realtime_batch_size: int = 16,
+                 
+                 # Multi-language parameters
+                 languages: Optional[List[str]] = None,
+                 language_smoothing_factor: float = 0.1,
+                 speechbrain_evaluation_interval: float = 3.0,
+                 audio_clips_dir: Optional[str] = None,
 
                  # Voice activation parameters
                  silero_sensitivity: float = INIT_SILERO_SENSITIVITY,
@@ -677,6 +688,41 @@ class AudioToTextRecorder:
         self.detected_language_probability = 0
         self.detected_realtime_language = None
         self.detected_realtime_language_probability = 0
+        
+        # Multi-language support initialization
+        self.languages = languages if languages else [language] if language else ['en']
+        self.language_smoothing_factor = language_smoothing_factor
+        self.speechbrain_evaluation_interval = speechbrain_evaluation_interval
+        self.audio_clips_dir = audio_clips_dir
+        
+        # Initialize multi-language structures
+        self.realtime_models = {}  # Dict to store models for each language
+        self.language_transcriptions = {}  # Dict to store transcriptions for each language
+        self.language_probabilities = {}  # Dict to store accumulated probabilities
+        self.last_speechbrain_eval = 0  # Timestamp of last SpeechBrain evaluation
+        self.accumulated_audio_clip = []  # Buffer for accumulated audio for clips
+        self.recording_start_timestamp = None  # When current recording started
+        
+        # Initialize language-specific data structures
+        for lang in self.languages:
+            self.language_transcriptions[lang] = ""
+            self.language_probabilities[lang] = 0.0
+        
+        # Try to import SpeechBrain for additional language evaluation
+        self.speechbrain_available = False
+        try:
+            from speechbrain.pretrained import EncoderClassifier
+            self.speechbrain_classifier = EncoderClassifier.from_hparams(
+                source="speechbrain/lang-id-commonlanguage_ecapa",
+                savedir="tmp_lang_id"
+            )
+            self.speechbrain_available = True
+            logger.info("SpeechBrain language identification loaded successfully")
+        except ImportError:
+            logger.warning("SpeechBrain not available for enhanced language detection")
+        except Exception as e:
+            logger.warning(f"Failed to load SpeechBrain: {e}")
+            
         self.transcription_lock = threading.Lock()
         self.shutdown_lock = threading.Lock()
         self.transcribe_count = 0
@@ -781,37 +827,46 @@ class AudioToTextRecorder:
                 )
             )
 
-        # Initialize the realtime transcription model
+        # Initialize the realtime transcription models for each language
         if self.enable_realtime_transcription and not self.use_main_model_for_realtime:
             try:
-                logger.info("Initializing faster_whisper realtime "
-                             f"transcription model {self.realtime_model_type}, "
-                             f"default device: {self.device}, "
-                             f"compute type: {self.compute_type}, "
-                             f"device index: {self.gpu_device_index}, "
-                             f"download root: {self.download_root}"
-                             )
-                self.realtime_model_type = faster_whisper.WhisperModel(
-                    model_size_or_path=self.realtime_model_type,
-                    device=self.device,
-                    compute_type=self.compute_type,
-                    device_index=self.gpu_device_index,
-                    download_root=self.download_root,
-                )
-                if self.realtime_batch_size > 0:
-                    self.realtime_model_type = BatchedInferencePipeline(model=self.realtime_model_type)
-
-                # Run a warm-up transcription
+                # Load warmup audio once
                 current_dir = os.path.dirname(os.path.realpath(__file__))
-                warmup_audio_path = os.path.join(
-                    current_dir, "warmup_audio.wav"
-                )
+                warmup_audio_path = os.path.join(current_dir, "warmup_audio.wav")
                 warmup_audio_data, _ = sf.read(warmup_audio_path, dtype="float32")
-                segments, info = self.realtime_model_type.transcribe(warmup_audio_data, language="en", beam_size=1)
-                model_warmup_transcription = " ".join(segment.text for segment in segments)
+                
+                # Initialize a model for each language
+                for lang in self.languages:
+                    logger.info("Initializing faster_whisper realtime "
+                                 f"transcription model {self.realtime_model_type} for language {lang}, "
+                                 f"default device: {self.device}, "
+                                 f"compute type: {self.compute_type}, "
+                                 f"device index: {self.gpu_device_index}, "
+                                 f"download root: {self.download_root}"
+                                 )
+                    
+                    model = faster_whisper.WhisperModel(
+                        model_size_or_path=self.realtime_model_type,
+                        device=self.device,
+                        compute_type=self.compute_type,
+                        device_index=self.gpu_device_index,
+                        download_root=self.download_root,
+                    )
+                    
+                    if self.realtime_batch_size > 0:
+                        model = BatchedInferencePipeline(model=model)
+                    
+                    # Store the model for this language
+                    self.realtime_models[lang] = model
+                    
+                    # Run a warm-up transcription for this language
+                    segments, info = model.transcribe(warmup_audio_data, language=lang if lang != 'auto' else None, beam_size=1)
+                    model_warmup_transcription = " ".join(segment.text for segment in segments)
+                    logger.debug(f"Warmup transcription for {lang}: {model_warmup_transcription}")
+                    
             except Exception as e:
                 logger.exception("Error initializing faster_whisper "
-                                  f"realtime transcription model: {e}"
+                                  f"realtime transcription models: {e}"
                                   )
                 raise
 
@@ -1874,9 +1929,26 @@ class AudioToTextRecorder:
                 self.realtime_thread.join()
 
             if self.enable_realtime_transcription:
-                if self.realtime_model_type:
-                    del self.realtime_model_type
-                    self.realtime_model_type = None
+                # Clean up multiple realtime models
+                for lang, model in self.realtime_models.items():
+                    try:
+                        del model
+                        logger.debug(f"Cleaned up realtime model for language: {lang}")
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up model for {lang}: {e}")
+                self.realtime_models.clear()
+                
+                # Clean up SpeechBrain if loaded
+                if self.speechbrain_available and hasattr(self, 'speechbrain_classifier'):
+                    try:
+                        del self.speechbrain_classifier
+                        logger.debug("Cleaned up SpeechBrain classifier")
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up SpeechBrain: {e}")
+                        
+                # Save any remaining audio clip
+                if len(self.accumulated_audio_clip) > 0:
+                    self._save_audio_clip()
             gc.collect()
 
     def _recording_worker(self):
@@ -2312,18 +2384,16 @@ class AudioToTextRecorder:
 
     def _realtime_worker(self):
         """
-        Performs real-time transcription if the feature is enabled.
+        Performs real-time transcription for multiple languages in parallel.
 
-        The method is responsible transcribing recorded audio frames
-          in real-time based on the specified resolution interval.
-        The transcribed text is stored in `self.realtime_transcription_text`
-          and a callback
-        function is invoked with this text if specified.
+        The method transcribes recorded audio frames in real-time for each configured language,
+        accumulates language probabilities, and selects the best transcription based on
+        language probability scores. Also includes SpeechBrain evaluation for additional
+        language confidence.
         """
 
         try:
-
-            logger.debug('Starting realtime worker')
+            logger.debug('Starting multi-language realtime worker')
 
             # Return immediately if real-time transcription is not enabled
             if not self.enable_realtime_transcription:
@@ -2335,6 +2405,9 @@ class AudioToTextRecorder:
             while self.is_running:
 
                 if self.is_recording:
+                    # Initialize recording timestamp if not set
+                    if self.recording_start_timestamp is None:
+                        self.recording_start_timestamp = time.time()
 
                     # MODIFIED SLEEP LOGIC:
                     # Wait until realtime_processing_pause has elapsed,
@@ -2357,147 +2430,307 @@ class AudioToTextRecorder:
                     audio_array = np.frombuffer(
                         b''.join(self.frames),
                         dtype=np.int16
-                        )
+                    )
 
                     logger.debug(f"Current realtime buffer size: {len(audio_array)}")
 
                     # Normalize the array to a [-1, 1] range
-                    audio_array = audio_array.astype(np.float32) / \
-                        INT16_MAX_ABS_VALUE
+                    audio_array = audio_array.astype(np.float32) / INT16_MAX_ABS_VALUE
+                    
+                    # Accumulate audio for clip saving and SpeechBrain evaluation
+                    self.accumulated_audio_clip.extend(audio_array)
 
-                    if self.use_main_model_for_realtime:
-                        with self.transcription_lock:
-                            try:
-                                self.parent_transcription_pipe.send((audio_array, self.language, True))
-                                if self.parent_transcription_pipe.poll(timeout=5):  # Wait for 5 seconds
-                                    logger.debug("Receive from realtime worker after transcription request to main model")
-                                    status, result = self.parent_transcription_pipe.recv()
-                                    if status == 'success':
-                                        segments, info = result
-                                        self.detected_realtime_language = info.language if info.language_probability > 0 else None
-                                        self.detected_realtime_language_probability = info.language_probability
-                                        realtime_text = segments
-                                        logger.debug(f"Realtime text detected with main model: {realtime_text}")
-                                    else:
-                                        logger.error(f"Realtime transcription error: {result}")
-                                        continue
-                                else:
-                                    logger.warning("Realtime transcription timed out")
-                                    continue
-                            except Exception as e:
-                                logger.error(f"Error in realtime transcription: {str(e)}", exc_info=True)
-                                continue
-                    else:
-                        # Perform transcription and assemble the text
-                        if self.normalize_audio:
-                            # normalize audio to -0.95 dBFS
-                            if audio_array is not None and audio_array.size > 0:
-                                peak = np.max(np.abs(audio_array))
-                                if peak > 0:
-                                    audio_array = (audio_array / peak) * 0.95
+                    # Normalize audio if needed
+                    if self.normalize_audio and audio_array is not None and audio_array.size > 0:
+                        peak = np.max(np.abs(audio_array))
+                        if peak > 0:
+                            audio_array = (audio_array / peak) * 0.95
 
-                        if self.realtime_batch_size > 0:
-                            segments, info = self.realtime_model_type.transcribe(
-                                audio_array,
-                                language=self.language if self.language else None,
-                                beam_size=self.beam_size_realtime,
-                                initial_prompt=self.initial_prompt_realtime,
-                                suppress_tokens=self.suppress_tokens,
-                                batch_size=self.realtime_batch_size,
-                                vad_filter=self.faster_whisper_vad_filter
+                    # Parallel transcription for all languages
+                    language_results = self._transcribe_parallel_languages(audio_array)
+                    
+                    # Update language probabilities with smoothing
+                    for lang, (text, prob) in language_results.items():
+                        if lang in self.language_probabilities:
+                            # Apply exponential smoothing: new_prob = α * current + (1-α) * old
+                            self.language_probabilities[lang] = (
+                                self.language_smoothing_factor * prob + 
+                                (1 - self.language_smoothing_factor) * self.language_probabilities[lang]
                             )
                         else:
-                            segments, info = self.realtime_model_type.transcribe(
-                                audio_array,
-                                language=self.language if self.language else None,
-                                beam_size=self.beam_size_realtime,
-                                initial_prompt=self.initial_prompt_realtime,
-                                suppress_tokens=self.suppress_tokens,
-                                vad_filter=self.faster_whisper_vad_filter
-                            )
+                            self.language_probabilities[lang] = prob
+                        
+                        self.language_transcriptions[lang] = text
 
-                        self.detected_realtime_language = info.language if info.language_probability > 0 else None
-                        self.detected_realtime_language_probability = info.language_probability
-                        realtime_text = " ".join(
-                            seg.text for seg in segments
-                        )
-                        logger.debug(f"Realtime text detected: {realtime_text}")
+                    # Perform SpeechBrain evaluation if available and interval passed
+                    current_time = time.time()
+                    if (self.speechbrain_available and 
+                        current_time - self.last_speechbrain_eval >= self.speechbrain_evaluation_interval and
+                        len(self.accumulated_audio_clip) >= int(3.0 * SAMPLE_RATE)):  # At least 3 seconds
+                        
+                        speechbrain_bonus = self._evaluate_with_speechbrain()
+                        if speechbrain_bonus:
+                            # Apply SpeechBrain bonus to language probabilities
+                            for lang, bonus in speechbrain_bonus.items():
+                                if lang in self.language_probabilities:
+                                    self.language_probabilities[lang] += bonus
+                        
+                        self.last_speechbrain_eval = current_time
 
-                    # double check recording state
-                    # because it could have changed mid-transcription
-                    if self.is_recording and time.time() - \
-                            self.recording_start_time > self.init_realtime_after_seconds:
+                    # Select the language with highest probability
+                    if self.language_probabilities:
+                        best_language = max(self.language_probabilities.keys(), 
+                                          key=lambda x: self.language_probabilities[x])
+                        best_text = self.language_transcriptions.get(best_language, "")
+                        best_probability = self.language_probabilities[best_language]
+                        
+                        # Update the detected language info
+                        self.detected_realtime_language = best_language
+                        self.detected_realtime_language_probability = best_probability
+                        
+                        logger.debug(f"Best language: {best_language} (prob: {best_probability:.3f}) - Text: {best_text}")
+                    else:
+                        best_text = ""
+                        best_language = self.languages[0] if self.languages else "en"
 
-                        self.realtime_transcription_text = realtime_text
-                        self.realtime_transcription_text = \
-                            self.realtime_transcription_text.strip()
+                    # Double check recording state (could have changed mid-transcription)
+                    if (self.is_recording and 
+                        time.time() - self.recording_start_time > self.init_realtime_after_seconds):
 
-                        self.text_storage.append(
-                            self.realtime_transcription_text
-                            )
+                        self.realtime_transcription_text = best_text.strip()
+
+                        self.text_storage.append(self.realtime_transcription_text)
 
                         # Take the last two texts in storage, if they exist
                         if len(self.text_storage) >= 2:
                             last_two_texts = self.text_storage[-2:]
 
-                            # Find the longest common prefix
-                            # between the two texts
-                            prefix = os.path.commonprefix(
-                                [last_two_texts[0], last_two_texts[1]]
-                                )
+                            # Find the longest common prefix between the two texts
+                            prefix = os.path.commonprefix([last_two_texts[0], last_two_texts[1]])
 
-                            # This prefix is the text that was transcripted
-                            # two times in the same way
+                            # This prefix is the text that was transcribed two times in the same way
                             # Store as "safely detected text"
-                            if len(prefix) >= \
-                                    len(self.realtime_stabilized_safetext):
-
-                                # Only store when longer than the previous
-                                # as additional security
+                            if len(prefix) >= len(self.realtime_stabilized_safetext):
+                                # Only store when longer than the previous as additional security
                                 self.realtime_stabilized_safetext = prefix
 
-                        # Find parts of the stabilized text
-                        # in the freshly transcripted text
+                        # Find parts of the stabilized text in the freshly transcribed text
                         matching_pos = self._find_tail_match_in_text(
                             self.realtime_stabilized_safetext,
                             self.realtime_transcription_text
-                            )
+                        )
 
                         if matching_pos < 0:
-                            # pick which text to send
+                            # Pick which text to send
                             text_to_send = (
                                 self.realtime_stabilized_safetext
                                 if self.realtime_stabilized_safetext
                                 else self.realtime_transcription_text
                             )
-                            # preprocess once
+                            # Preprocess once
                             processed = self._preprocess_output(text_to_send, True)
-                            # invoke on its own thread
+                            # Invoke on its own thread
                             self._run_callback(self._on_realtime_transcription_stabilized, processed)
 
                         else:
-                            # We found parts of the stabilized text
-                            # in the transcripted text
-                            # We now take the stabilized text
-                            # and add only the freshly transcripted part to it
-                            output_text = self.realtime_stabilized_safetext + \
-                                self.realtime_transcription_text[matching_pos:]
+                            # We found parts of the stabilized text in the transcribed text
+                            # We now take the stabilized text and add only the freshly transcribed part to it
+                            output_text = (self.realtime_stabilized_safetext + 
+                                         self.realtime_transcription_text[matching_pos:])
 
                             # This yields us the "left" text part as stabilized
-                            # AND at the same time delivers fresh detected
-                            # parts on the first run without the need for
-                            # two transcriptions
-                            self._run_callback(self._on_realtime_transcription_stabilized, self._preprocess_output(output_text, True))
+                            # AND at the same time delivers fresh detected parts on the first run
+                            self._run_callback(self._on_realtime_transcription_stabilized, 
+                                             self._preprocess_output(output_text, True))
 
                         # Invoke the callback with the transcribed text
-                        self._run_callback(self._on_realtime_transcription_update, self._preprocess_output(self.realtime_transcription_text,True))
+                        self._run_callback(self._on_realtime_transcription_update, 
+                                         self._preprocess_output(self.realtime_transcription_text, True))
 
                 # If not recording, sleep briefly before checking again
                 else:
+                    # Reset recording timestamp when not recording
+                    self.recording_start_timestamp = None
+                    # Save accumulated audio clip if we have enough data
+                    if len(self.accumulated_audio_clip) > 0:
+                        self._save_audio_clip()
+                        self.accumulated_audio_clip = []
+                    
                     time.sleep(TIME_SLEEP)
 
         except Exception as e:
-            logger.error(f"Unhandled exeption in _realtime_worker: {e}", exc_info=True)
+            logger.error(f"Unhandled exception in _realtime_worker: {e}", exc_info=True)
+            raise
+
+    def _transcribe_parallel_languages(self, audio_array):
+        """
+        Transcribe audio for all configured languages in parallel using ThreadPoolExecutor.
+        
+        Args:
+            audio_array: The audio data to transcribe
+            
+        Returns:
+            Dict mapping language codes to (transcription_text, probability) tuples
+        """
+        results = {}
+        
+        if self.use_main_model_for_realtime:
+            # Use main model - process languages sequentially for now
+            # (could be parallelized but would require multiple main model processes)
+            for lang in self.languages:
+                try:
+                    with self.transcription_lock:
+                        self.parent_transcription_pipe.send((audio_array, lang, True))
+                        if self.parent_transcription_pipe.poll(timeout=5):  # Wait for 5 seconds
+                            logger.debug(f"Receive from realtime worker for language {lang}")
+                            status, result = self.parent_transcription_pipe.recv()
+                            if status == 'success':
+                                segments, info = result
+                                transcription = segments if isinstance(segments, str) else " ".join(seg.text for seg in segments)
+                                probability = getattr(info, 'language_probability', 0.0)
+                                results[lang] = (transcription, probability)
+                            else:
+                                logger.error(f"Realtime transcription error for {lang}: {result}")
+                                results[lang] = ("", 0.0)
+                        else:
+                            logger.warning(f"Realtime transcription timed out for {lang}")
+                            results[lang] = ("", 0.0)
+                except Exception as e:
+                    logger.error(f"Error in realtime transcription for {lang}: {str(e)}", exc_info=True)
+                    results[lang] = ("", 0.0)
+        else:
+            # Use dedicated realtime models - process in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.languages)) as executor:
+                future_to_lang = {}
+                
+                for lang in self.languages:
+                    if lang in self.realtime_models:
+                        future = executor.submit(self._transcribe_single_language, audio_array, lang)
+                        future_to_lang[future] = lang
+                
+                # Collect results as they complete
+                for future in concurrent.futures.as_completed(future_to_lang):
+                    lang = future_to_lang[future]
+                    try:
+                        text, probability = future.result()
+                        results[lang] = (text, probability)
+                    except Exception as e:
+                        logger.error(f"Error transcribing language {lang}: {e}")
+                        results[lang] = ("", 0.0)
+        
+        return results
+    
+    def _transcribe_single_language(self, audio_array, language):
+        """
+        Transcribe audio for a single language.
+        
+        Args:
+            audio_array: The audio data to transcribe
+            language: Language code
+            
+        Returns:
+            Tuple of (transcription_text, probability)
+        """
+        try:
+            model = self.realtime_models[language]
+            
+            if self.realtime_batch_size > 0:
+                segments, info = model.transcribe(
+                    audio_array,
+                    language=language if language != 'auto' else None,
+                    beam_size=self.beam_size_realtime,
+                    initial_prompt=self.initial_prompt_realtime,
+                    suppress_tokens=self.suppress_tokens,
+                    batch_size=self.realtime_batch_size,
+                    vad_filter=self.faster_whisper_vad_filter
+                )
+            else:
+                segments, info = model.transcribe(
+                    audio_array,
+                    language=language if language != 'auto' else None,
+                    beam_size=self.beam_size_realtime,
+                    initial_prompt=self.initial_prompt_realtime,
+                    suppress_tokens=self.suppress_tokens,
+                    vad_filter=self.faster_whisper_vad_filter
+                )
+
+            transcription = " ".join(seg.text for seg in segments)
+            probability = getattr(info, 'language_probability', 0.0)
+            
+            logger.debug(f"Language {language}: {transcription} (prob: {probability:.3f})")
+            return transcription, probability
+            
+        except Exception as e:
+            logger.error(f"Error in single language transcription for {language}: {e}")
+            return "", 0.0
+    
+    def _evaluate_with_speechbrain(self):
+        """
+        Use SpeechBrain to evaluate the language of the last 3 seconds of audio.
+        
+        Returns:
+            Dict mapping language codes to bonus scores (0.0 to 0.1)
+        """
+        if not self.speechbrain_available or len(self.accumulated_audio_clip) < int(3.0 * SAMPLE_RATE):
+            return {}
+        
+        try:
+            # Get last 3 seconds of audio
+            last_3_seconds = self.accumulated_audio_clip[-int(3.0 * SAMPLE_RATE):]
+            audio_tensor = torch.tensor(last_3_seconds).unsqueeze(0)
+            
+            # Get language prediction from SpeechBrain
+            prediction = self.speechbrain_classifier.classify_batch(audio_tensor)
+            predicted_lang = prediction[0][0]  # Get the top prediction
+            
+            # Convert SpeechBrain language code to our language codes if needed
+            lang_mapping = {
+                'en': 'en', 'es': 'es', 'fr': 'fr', 'de': 'de', 'it': 'it', 
+                'pt': 'pt', 'ru': 'ru', 'ja': 'ja', 'ko': 'ko', 'zh': 'zh'
+                # Add more mappings as needed
+            }
+            
+            mapped_lang = lang_mapping.get(predicted_lang, predicted_lang)
+            
+            # Create bonus dictionary
+            bonus = {}
+            for lang in self.languages:
+                if lang == mapped_lang:
+                    bonus[lang] = 0.05  # 5% bonus for SpeechBrain match
+                else:
+                    bonus[lang] = 0.0
+                    
+            logger.debug(f"SpeechBrain detected language: {predicted_lang} -> {mapped_lang}")
+            return bonus
+            
+        except Exception as e:
+            logger.error(f"Error in SpeechBrain evaluation: {e}")
+            return {}
+    
+    def _save_audio_clip(self):
+        """
+        Save the accumulated audio clip to the specified directory.
+        """
+        if not self.audio_clips_dir or not self.accumulated_audio_clip:
+            return
+        
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(self.audio_clips_dir, exist_ok=True)
+            
+            # Generate filename with timestamp
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            filename = f"audio_clip_{timestamp}.wav"
+            filepath = os.path.join(self.audio_clips_dir, filename)
+            
+            # Convert to numpy array and save
+            audio_data = np.array(self.accumulated_audio_clip, dtype=np.float32)
+            sf.write(filepath, audio_data, SAMPLE_RATE)
+            
+            logger.debug(f"Saved audio clip: {filepath} ({len(audio_data)/SAMPLE_RATE:.2f}s)")
+            
+        except Exception as e:
+            logger.error(f"Error saving audio clip: {e}")
             raise
 
     def _is_silero_speech(self, chunk):

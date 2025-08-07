@@ -597,6 +597,19 @@ def parse_arguments():
 
     parser.add_argument('--logchunks', action='store_true', help='Enable logging of incoming audio chunks (periods)')
 
+    # Multi-language support arguments
+    parser.add_argument('--languages', type=str, nargs='*', 
+                        help='List of language codes to process in parallel (e.g., --languages en es fr). If not specified, uses the single language from --language.')
+    
+    parser.add_argument('--language_smoothing_factor', type=float, default=0.1,
+                        help='Smoothing factor for language probability accumulation (0.0-1.0). Lower values make language selection more stable. Default is 0.1.')
+    
+    parser.add_argument('--speechbrain_evaluation_interval', type=float, default=3.0,
+                        help='Interval in seconds for SpeechBrain language evaluation. Default is 3.0 seconds.')
+    
+    parser.add_argument('--audio_clips_dir', type=str,
+                        help='Directory to save audio clips. If not specified, audio clips are not saved.')
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -1079,7 +1092,7 @@ async def main_async():
         'model': args.model,
         'download_root': args.root,
         'realtime_model_type': args.rt_model,
-        'language': args.lang,
+        'languages': args.languages if args.languages else [args.lang] if args.lang else ['en'],
         'batch_size': args.batch,
         'init_realtime_after_seconds': args.init_realtime_after_seconds,
         'realtime_batch_size': args.realtime_batch_size,
@@ -1133,6 +1146,11 @@ async def main_async():
         'suppress_tokens': args.suppress_tokens,
         'allowed_latency_limit': args.allowed_latency_limit,
         'faster_whisper_vad_filter': args.faster_whisper_vad_filter,
+        
+        # Multi-language parameters
+        'language_smoothing_factor': args.language_smoothing_factor,
+        'speechbrain_evaluation_interval': args.speechbrain_evaluation_interval,
+        'audio_clips_dir': args.audio_clips_dir,
     }
 
     try:
