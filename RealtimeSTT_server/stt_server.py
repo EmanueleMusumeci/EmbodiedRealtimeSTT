@@ -94,6 +94,13 @@ silence_timing = False
 writechunks = False
 wav_file = None
 
+# Global activity tracking variables
+last_realtime_activity = 0.0
+last_whisper_response = 0.0
+last_vad_activity = 0.0  # Track when VAD last detected speech
+vad_speech_detected = False  # Track if we're currently in a speech period
+speech_started_time = 0.0  # When current speech period started
+
 hard_break_even_on_background_noise = 3.0
 hard_break_even_on_background_noise_min_texts = 3
 hard_break_even_on_background_noise_min_similarity = 0.99
@@ -254,7 +261,12 @@ def format_timestamp_ns(timestamp_ns: int) -> str:
     return formatted_timestamp
 
 def text_detected(text, loop):
-    global prev_text
+    global prev_text, last_realtime_activity, last_whisper_response
+    
+    # Update real-time activity tracking - this indicates Whisper is responding
+    current_time = time.time()
+    last_realtime_activity = current_time
+    last_whisper_response = current_time
 
     text = preprocess_text(text)
 
@@ -333,12 +345,30 @@ def on_recording_stop(loop):
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_vad_detect_start(loop):
+    global last_realtime_activity, last_vad_activity, vad_speech_detected, speech_started_time
+    current_time = time.time()
+    last_realtime_activity = current_time
+    last_vad_activity = current_time
+    vad_speech_detected = True
+    speech_started_time = current_time
+    
+    if debug_logging:
+        print(f"[DEBUG] VAD detected speech start at {current_time}")
+    
     message = json.dumps({
         'type': 'vad_detect_start'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_vad_detect_stop(loop):
+    global last_vad_activity, vad_speech_detected
+    current_time = time.time()
+    last_vad_activity = current_time
+    vad_speech_detected = False
+    
+    if debug_logging:
+        print(f"[DEBUG] VAD detected speech stop at {current_time}")
+    
     message = json.dumps({
         'type': 'vad_detect_stop'
     })
@@ -363,6 +393,9 @@ def on_wakeword_detection_end(loop):
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_transcription_start(_audio_bytes, loop):
+    global last_whisper_response
+    last_whisper_response = time.time()  # Update when transcription starts
+    
     bytes_b64 = base64.b64encode(_audio_bytes.tobytes()).decode('utf-8')
     message = json.dumps({
         'type': 'transcription_start',
@@ -506,6 +539,15 @@ def parse_arguments():
 
     parser.add_argument('--wake_word_timeout', type=float, default=5.0,
                         help='Maximum time in seconds that the system will wait for a wake word before timing out. After this timeout, the system stops listening for wake words until reactivated. Default is 5.0 seconds.')
+    
+    parser.add_argument('--transcription_timeout', type=float, default=30.0,
+                        help='Timeout in seconds for detecting stuck transcription. The system will attempt recovery if no Whisper responses are received for this duration. Default is 30.0 seconds.')
+    
+    parser.add_argument('--whisper_responsiveness_timeout', type=float, default=60.0,
+                        help='Timeout in seconds for detecting unresponsive Whisper model. If no real-time updates or full sentences are received for this duration, recovery will be triggered. Default is 60.0 seconds.')
+    
+    parser.add_argument('--eos_timeout', type=float, default=15.0,
+                        help='Timeout in seconds for detecting missing end-of-sentence after VAD stops detecting speech. If VAD detects speech but no sentence completion occurs within this time after speech ends, recovery will be triggered. Default is 15.0 seconds.')
 
     parser.add_argument('--wake_word_activation_delay', type=float, default=0,
                         help='The delay in seconds before the wake word detection is activated after the system starts listening. This prevents false positives during the start of a session. Default is 0 seconds.')
@@ -581,10 +623,18 @@ def parse_arguments():
     return args
 
 def _recorder_thread(loop):
-    global recorder, stop_recorder
+    global recorder, stop_recorder, last_realtime_activity, last_whisper_response, last_vad_activity, vad_speech_detected, speech_started_time
     import threading
     import time
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+    
+    # Initialize global activity tracking
+    current_time = time.time()
+    last_realtime_activity = current_time
+    last_whisper_response = current_time
+    last_vad_activity = current_time
+    vad_speech_detected = False
+    speech_started_time = 0.0
     
     print(f"{bcolors.OKGREEN}Initializing RealtimeSTT server with parameters:{bcolors.ENDC}")
     for key, value in recorder_config.items():
@@ -606,11 +656,15 @@ def _recorder_thread(loop):
     
     recorder_ready.set()
     
-    # Configuration for timeout and recovery
-    transcription_timeout = 30.0  # 30 seconds timeout
+    # Configuration for timeout and recovery (using command line arguments)
+    transcription_timeout = global_args.transcription_timeout if global_args else 30.0
+    whisper_responsiveness_timeout = global_args.whisper_responsiveness_timeout if global_args else 60.0
+    eos_timeout = global_args.eos_timeout if global_args else 15.0  # Timeout for missing EOS after speech
     max_consecutive_failures = 3
     consecutive_failures = 0
     last_activity_time = time.time()
+    last_realtime_activity = time.time()  # Track real-time transcription activity
+    last_whisper_response = time.time()   # Track actual Whisper model responsiveness
     
     # Thread pool for timeout management
     executor = ThreadPoolExecutor(max_workers=2)
@@ -620,6 +674,14 @@ def _recorder_thread(loop):
         nonlocal last_activity_time, consecutive_failures
         
         try:
+            # Update global activity tracking for full sentence processing
+            global last_whisper_response, vad_speech_detected, speech_started_time
+            last_whisper_response = time.time()
+            
+            # Reset speech tracking since we got a complete sentence
+            vad_speech_detected = False
+            speech_started_time = 0.0
+            
             prev_text = ""
             full_sentence = preprocess_text(full_sentence)
             message = json.dumps({
@@ -655,7 +717,7 @@ def _recorder_thread(loop):
     
     def recover_recorder():
         """Attempt to recover stuck recorder"""
-        global recorder
+        global recorder, last_realtime_activity, last_whisper_response, last_vad_activity, vad_speech_detected, speech_started_time
         nonlocal consecutive_failures
         print(f"{bcolors.WARNING}Attempting to recover recorder...{bcolors.ENDC}")
         
@@ -671,6 +733,15 @@ def _recorder_thread(loop):
             # Reinitialize recorder
             recorder = AudioToTextRecorder(**recorder_config)
             consecutive_failures = 0
+            
+            # Reset all activity tracking after successful recovery
+            current_time = time.time()
+            last_realtime_activity = current_time
+            last_whisper_response = current_time
+            last_vad_activity = current_time
+            vad_speech_detected = False
+            speech_started_time = 0.0
+            
             print(f"{bcolors.OKGREEN}Recorder recovered successfully{bcolors.ENDC}")
             return True
             
@@ -683,13 +754,51 @@ def _recorder_thread(loop):
         while not stop_recorder:
             current_time = time.time()
             
-            # Check for stuck transcription (no activity for too long)
-            if current_time - last_activity_time > transcription_timeout:
-                print(f"{bcolors.WARNING}Transcription appears stuck, attempting recovery...{bcolors.ENDC}")
+            # Check for missing EOS after speech detection
+            # This is the main issue: VAD detected speech but no sentence completion
+            time_since_last_vad = current_time - last_vad_activity
+            time_since_speech_started = current_time - speech_started_time if speech_started_time > 0 else float('inf')
+            
+            # Trigger recovery if:
+            # 1. We had recent VAD activity (someone was speaking)
+            # 2. But no complete sentence was produced for too long after VAD stopped detecting speech
+            # 3. This indicates Whisper is stuck and not signaling EOS properly
+            if (not vad_speech_detected and  # VAD is not currently detecting speech
+                speech_started_time > 0 and  # We had a speech period
+                time_since_last_vad > eos_timeout and  # Enough time passed since VAD last detected speech
+                time_since_speech_started > eos_timeout):  # The speech period lasted long enough to be significant
+                
+                print(f"{bcolors.WARNING}Missing EOS detected: Speech ended {time_since_last_vad:.1f}s ago but no sentence completion. Attempting recovery...{bcolors.ENDC}")
                 if not recover_recorder():
                     print(f"{bcolors.FAIL}Could not recover recorder{bcolors.ENDC}")
                     break
+                # Reset all activity timers after recovery
                 last_activity_time = current_time
+                last_realtime_activity = current_time
+                last_whisper_response = current_time
+                last_vad_activity = current_time
+                vad_speech_detected = False
+                speech_started_time = 0.0
+                continue
+            
+            # Secondary check: General Whisper unresponsiveness (much longer timeout)
+            # Only for cases where the system is completely stuck
+            time_since_whisper = current_time - last_whisper_response
+            time_since_full_sentence = current_time - last_activity_time
+            
+            if (time_since_whisper > whisper_responsiveness_timeout and 
+                time_since_full_sentence > whisper_responsiveness_timeout):
+                print(f"{bcolors.WARNING}Whisper appears completely unresponsive (no activity for {time_since_whisper:.1f}s), attempting recovery...{bcolors.ENDC}")
+                if not recover_recorder():
+                    print(f"{bcolors.FAIL}Could not recover recorder{bcolors.ENDC}")
+                    break
+                # Reset all activity timers after recovery
+                last_activity_time = current_time
+                last_realtime_activity = current_time
+                last_whisper_response = current_time
+                last_vad_activity = current_time
+                vad_speech_detected = False
+                speech_started_time = 0.0
                 continue
             
             # Check for too many consecutive failures
@@ -704,7 +813,7 @@ def _recorder_thread(loop):
             future = None
             try:
                 future = executor.submit(text_with_timeout)
-                success = future.result(timeout=transcription_timeout)
+                success = future.result(timeout=transcription_timeout)  # Use configurable timeout
                 
                 if not success:
                     consecutive_failures += 1
@@ -725,6 +834,14 @@ def _recorder_thread(loop):
                 if not recover_recorder():
                     print(f"{bcolors.FAIL}Could not recover after timeout{bcolors.ENDC}")
                     break
+            
+            # Add debug logging for activity tracking
+            if debug_logging:
+                time_since_realtime = current_time - last_realtime_activity
+                time_since_whisper = current_time - last_whisper_response
+                time_since_full_sentence = current_time - last_activity_time
+                print(f"[DEBUG] Activity tracking - EOS timeout: {eos_timeout}s, VAD: {time_since_last_vad:.1f}s ago, Speech started: {time_since_speech_started:.1f}s ago, Currently detecting: {vad_speech_detected}")
+                print(f"[DEBUG] Whisper activity - Realtime: {time_since_realtime:.1f}s, Whisper: {time_since_whisper:.1f}s, Full: {time_since_full_sentence:.1f}s")
             
             # Small delay to prevent busy loop
             time.sleep(0.1)
