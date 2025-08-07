@@ -159,6 +159,15 @@ import logging
 import wave
 import json
 import time
+import argparse
+
+# Try to import language detection if available
+try:
+    from .language_detector import LanguageDetector
+    LANGUAGE_DETECTION_AVAILABLE = True
+except ImportError:
+    LANGUAGE_DETECTION_AVAILABLE = False
+    LanguageDetector = None
 
 global_args = None
 recorder = None
@@ -416,6 +425,9 @@ def parse_arguments():
     parser.add_argument('-c', '--control', '--control_port', type=int, default=8011,
                         help='The port number used for the control WebSocket connection. Control connections are used to send and receive commands to the server. Default is port 8011.')
 
+    parser.add_argument('-I', '--local_ip', type=str, default='127.0.0.1',
+                        help='The local IP address to bind the WebSocket server to. Default is 127.0.0.1.')
+
     parser.add_argument('-d', '--data', '--data_port', type=int, default=8012,
                         help='The port number used for the data WebSocket connection. Data connections are used to send audio data and receive transcription updates in real time. Default is port 8012.')
 
@@ -570,35 +582,155 @@ def parse_arguments():
 
 def _recorder_thread(loop):
     global recorder, stop_recorder
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+    
     print(f"{bcolors.OKGREEN}Initializing RealtimeSTT server with parameters:{bcolors.ENDC}")
     for key, value in recorder_config.items():
         print(f"    {bcolors.OKBLUE}{key}{bcolors.ENDC}: {value}")
-    recorder = AudioToTextRecorder(**recorder_config)
-    print(f"{bcolors.OKGREEN}{bcolors.BOLD}RealtimeSTT initialized{bcolors.ENDC}")
+    
+    # Initialize recorder with retry mechanism
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            recorder = AudioToTextRecorder(**recorder_config)
+            print(f"{bcolors.OKGREEN}{bcolors.BOLD}RealtimeSTT initialized{bcolors.ENDC}")
+            break
+        except Exception as e:
+            print(f"{bcolors.FAIL}Failed to initialize recorder (attempt {attempt + 1}/{max_retries}): {e}{bcolors.ENDC}")
+            if attempt == max_retries - 1:
+                print(f"{bcolors.FAIL}Could not initialize recorder after {max_retries} attempts{bcolors.ENDC}")
+                return
+            time.sleep(2)
+    
     recorder_ready.set()
+    
+    # Configuration for timeout and recovery
+    transcription_timeout = 30.0  # 30 seconds timeout
+    max_consecutive_failures = 3
+    consecutive_failures = 0
+    last_activity_time = time.time()
+    
+    # Thread pool for timeout management
+    executor = ThreadPoolExecutor(max_workers=2)
     
     def process_text(full_sentence):
         global prev_text
-        prev_text = ""
-        full_sentence = preprocess_text(full_sentence)
-        message = json.dumps({
-            'type': 'fullSentence',
-            'text': full_sentence
-        })
-        # Use the passed event loop here
-        asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+        nonlocal last_activity_time, consecutive_failures
+        
+        try:
+            prev_text = ""
+            full_sentence = preprocess_text(full_sentence)
+            message = json.dumps({
+                'type': 'fullSentence',
+                'text': full_sentence
+            })
+            # Use the passed event loop here
+            asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-        timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
 
-        if extended_logging:
-            print(f"  [{timestamp}] Full text: {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n", flush=True, end="")
-        else:
-            print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
+            if extended_logging:
+                print(f"  [{timestamp}] Full text: {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n", flush=True, end="")
+            else:
+                print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
+            
+            # Reset failure counter on success
+            consecutive_failures = 0
+            last_activity_time = time.time()
+            
+        except Exception as e:
+            print(f"{bcolors.FAIL}Error processing text: {e}{bcolors.ENDC}")
+            consecutive_failures += 1
+    
+    def text_with_timeout():
+        """Wrapper for recorder.text() with timeout"""
+        try:
+            recorder.text(process_text)
+            return True
+        except Exception as e:
+            print(f"{bcolors.FAIL}Transcription error: {e}{bcolors.ENDC}")
+            return False
+    
+    def recover_recorder():
+        """Attempt to recover stuck recorder"""
+        nonlocal recorder, consecutive_failures
+        print(f"{bcolors.WARNING}Attempting to recover recorder...{bcolors.ENDC}")
+        
+        try:
+            # Try to abort and clear
+            if recorder:
+                recorder.abort()
+                recorder.clear_audio_queue()
+                time.sleep(1.0)
+                
+            # Reinitialize recorder
+            recorder = AudioToTextRecorder(**recorder_config)
+            consecutive_failures = 0
+            print(f"{bcolors.OKGREEN}Recorder recovered successfully{bcolors.ENDC}")
+            return True
+            
+        except Exception as e:
+            print(f"{bcolors.FAIL}Recovery failed: {e}{bcolors.ENDC}")
+            consecutive_failures += 1
+            return False
+    
     try:
         while not stop_recorder:
-            recorder.text(process_text)
+            current_time = time.time()
+            
+            # Check for stuck transcription (no activity for too long)
+            if current_time - last_activity_time > transcription_timeout:
+                print(f"{bcolors.WARNING}Transcription appears stuck, attempting recovery...{bcolors.ENDC}")
+                if not recover_recorder():
+                    print(f"{bcolors.FAIL}Could not recover recorder{bcolors.ENDC}")
+                    break
+                last_activity_time = current_time
+                continue
+            
+            # Check for too many consecutive failures
+            if consecutive_failures >= max_consecutive_failures:
+                print(f"{bcolors.WARNING}Too many consecutive failures ({consecutive_failures}), attempting recovery...{bcolors.ENDC}")
+                if not recover_recorder():
+                    print(f"{bcolors.FAIL}Could not recover after {consecutive_failures} failures{bcolors.ENDC}")
+                    break
+                continue
+            
+            # Submit transcription task with timeout
+            try:
+                future = executor.submit(text_with_timeout)
+                success = future.result(timeout=transcription_timeout)
+                
+                if not success:
+                    consecutive_failures += 1
+                    print(f"{bcolors.WARNING}Transcription failed (failure count: {consecutive_failures}){bcolors.ENDC}")
+                    
+            except FutureTimeoutError:
+                print(f"{bcolors.WARNING}Transcription timed out after {transcription_timeout} seconds{bcolors.ENDC}")
+                consecutive_failures += 1
+                
+                # Cancel the future to prevent resource leaks
+                future.cancel()
+                
+                # Force recovery on timeout
+                if not recover_recorder():
+                    print(f"{bcolors.FAIL}Could not recover after timeout{bcolors.ENDC}")
+                    break
+            
+            # Small delay to prevent busy loop
+            time.sleep(0.1)
+            
     except KeyboardInterrupt:
         print(f"{bcolors.WARNING}Exiting application due to keyboard interrupt{bcolors.ENDC}")
+    finally:
+        # Cleanup
+        try:
+            if recorder:
+                recorder.shutdown()
+            executor.shutdown(wait=False)
+        except Exception as e:
+            print(f"{bcolors.WARNING}Cleanup error: {e}{bcolors.ENDC}")
 
 def decode_and_resample(
         audio_data,
@@ -857,10 +989,10 @@ async def main_async():
 
     try:
         # Attempt to start control and data servers
-        control_server = await websockets.serve(control_handler, "localhost", args.control)
-        data_server = await websockets.serve(data_handler, "localhost", args.data)
-        print(f"{bcolors.OKGREEN}Control server started on {bcolors.OKBLUE}ws://localhost:{args.control}{bcolors.ENDC}")
-        print(f"{bcolors.OKGREEN}Data server started on {bcolors.OKBLUE}ws://localhost:{args.data}{bcolors.ENDC}")
+        control_server = await websockets.serve(control_handler, args.local_ip, args.control)
+        data_server = await websockets.serve(data_handler, args.local_ip, args.data)
+        print(f"{bcolors.OKGREEN}Control server started on {bcolors.OKBLUE}ws://{args.local_ip}:{args.control}{bcolors.ENDC}")
+        print(f"{bcolors.OKGREEN}Data server started on {bcolors.OKBLUE}ws://{args.local_ip}:{args.data}{bcolors.ENDC}")
 
         # Start the broadcast and recorder threads
         broadcast_task = asyncio.create_task(broadcast_audio_messages())
