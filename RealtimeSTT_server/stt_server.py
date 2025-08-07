@@ -49,6 +49,9 @@ stt-server [OPTIONS]
     - `--mid_sentence_detection_pause`: Pause for mid-sentence break; default 2.0.
     - `--wake_words_sensitivity`: Wake word detection sensitivity (0-1); default 0.5.
     - `--wake_word_timeout`: Wake word timeout in seconds; default 5.0.
+    - `--transcription_timeout`: Base timeout for safety timeout calculation; default 0.0 (disabled). Set to 0 to disable safety timeout.
+    - `--whisper_responsiveness_timeout`: Timeout for detecting unresponsive Whisper model; default 0.0 (disabled).
+    - `--eos_timeout`: Timeout for detecting missing end-of-sentence after VAD stops; default 15.0.
     - `--wake_word_activation_delay`: Delay before wake word activation; default 20.
     - `--wakeword_backend`: Backend for wake word detection; default 'none'.
     - `--openwakeword_model_paths`: Paths to OpenWakeWord models.
@@ -165,6 +168,8 @@ import threading
 import logging
 import wave
 import json
+import time
+import argparse
 import time
 import argparse
 
@@ -540,14 +545,14 @@ def parse_arguments():
     parser.add_argument('--wake_word_timeout', type=float, default=5.0,
                         help='Maximum time in seconds that the system will wait for a wake word before timing out. After this timeout, the system stops listening for wake words until reactivated. Default is 5.0 seconds.')
     
-    parser.add_argument('--transcription_timeout', type=float, default=30.0,
-                        help='Timeout in seconds for detecting stuck transcription. The system will attempt recovery if no Whisper responses are received for this duration. Default is 30.0 seconds.')
+    parser.add_argument('--transcription_timeout', type=float, default=0.0,
+                        help='Base timeout in seconds used to calculate safety timeout (safety_timeout = transcription_timeout * 10). The safety timeout is a last resort for completely frozen processes. Set to 0 to disable safety timeout completely. The main recovery logic uses eos_timeout for stuck transcription detection. Default is 0.0 (disabled).')
     
-    parser.add_argument('--whisper_responsiveness_timeout', type=float, default=60.0,
-                        help='Timeout in seconds for detecting unresponsive Whisper model. If no real-time updates or full sentences are received for this duration, recovery will be triggered. Default is 60.0 seconds.')
+    parser.add_argument('--whisper_responsiveness_timeout', type=float, default=0.0,
+                        help='Timeout in seconds for detecting unresponsive Whisper model. If no real-time updates or full sentences are received for this duration, recovery will be triggered. Set to 0 to disable this timeout. Default is 0.0 (disabled).')
     
     parser.add_argument('--eos_timeout', type=float, default=15.0,
-                        help='Timeout in seconds for detecting missing end-of-sentence after VAD stops detecting speech. If VAD detects speech but no sentence completion occurs within this time after speech ends, recovery will be triggered. Default is 15.0 seconds.')
+                        help='Timeout in seconds for detecting missing end-of-sentence after VAD stops detecting speech. If VAD detects speech but no sentence completion occurs within this time after speech ends, recovery will be triggered. This is the primary recovery mechanism for robot use cases. Default is 15.0 seconds.')
 
     parser.add_argument('--wake_word_activation_delay', type=float, default=0,
                         help='The delay in seconds before the wake word detection is activated after the system starts listening. This prevents false positives during the start of a session. Default is 0 seconds.')
@@ -657,9 +662,16 @@ def _recorder_thread(loop):
     recorder_ready.set()
     
     # Configuration for timeout and recovery (using command line arguments)
-    transcription_timeout = global_args.transcription_timeout if global_args else 30.0
-    whisper_responsiveness_timeout = global_args.whisper_responsiveness_timeout if global_args else 60.0
+    transcription_timeout = global_args.transcription_timeout if global_args else 0.0
+    whisper_responsiveness_timeout = global_args.whisper_responsiveness_timeout if global_args else 0.0
     eos_timeout = global_args.eos_timeout if global_args else 15.0  # Timeout for missing EOS after speech
+    
+    # Log timeout configuration
+    print(f"{bcolors.OKBLUE}Timeout configuration:{bcolors.ENDC}")
+    print(f"    EOS timeout: {eos_timeout}s {'(enabled)' if eos_timeout > 0 else '(disabled)'}")
+    print(f"    Whisper responsiveness timeout: {whisper_responsiveness_timeout}s {'(enabled)' if whisper_responsiveness_timeout > 0 else '(disabled)'}")
+    print(f"    Safety timeout: {transcription_timeout * 10}s {'(enabled)' if transcription_timeout > 0 else '(disabled)'}")
+    
     max_consecutive_failures = 3
     consecutive_failures = 0
     last_activity_time = time.time()
@@ -754,52 +766,54 @@ def _recorder_thread(loop):
         while not stop_recorder:
             current_time = time.time()
             
-            # Check for missing EOS after speech detection
+            # Check for missing EOS after speech detection (only if EOS timeout is enabled)
             # This is the main issue: VAD detected speech but no sentence completion
-            time_since_last_vad = current_time - last_vad_activity
-            time_since_speech_started = current_time - speech_started_time if speech_started_time > 0 else float('inf')
-            
-            # Trigger recovery if:
-            # 1. We had recent VAD activity (someone was speaking)
-            # 2. But no complete sentence was produced for too long after VAD stopped detecting speech
-            # 3. This indicates Whisper is stuck and not signaling EOS properly
-            if (not vad_speech_detected and  # VAD is not currently detecting speech
-                speech_started_time > 0 and  # We had a speech period
-                time_since_last_vad > eos_timeout and  # Enough time passed since VAD last detected speech
-                time_since_speech_started > eos_timeout):  # The speech period lasted long enough to be significant
+            if eos_timeout > 0:  # Only check if EOS timeout is enabled
+                time_since_last_vad = current_time - last_vad_activity
+                time_since_speech_started = current_time - speech_started_time if speech_started_time > 0 else float('inf')
                 
-                print(f"{bcolors.WARNING}Missing EOS detected: Speech ended {time_since_last_vad:.1f}s ago but no sentence completion. Attempting recovery...{bcolors.ENDC}")
-                if not recover_recorder():
-                    print(f"{bcolors.FAIL}Could not recover recorder{bcolors.ENDC}")
-                    break
-                # Reset all activity timers after recovery
-                last_activity_time = current_time
-                last_realtime_activity = current_time
-                last_whisper_response = current_time
-                last_vad_activity = current_time
-                vad_speech_detected = False
-                speech_started_time = 0.0
-                continue
+                # Trigger recovery if:
+                # 1. We had recent VAD activity (someone was speaking)
+                # 2. But no complete sentence was produced for too long after VAD stopped detecting speech
+                # 3. This indicates Whisper is stuck and not signaling EOS properly
+                if (not vad_speech_detected and  # VAD is not currently detecting speech
+                    speech_started_time > 0 and  # We had a speech period
+                    time_since_last_vad > eos_timeout and  # Enough time passed since VAD last detected speech
+                    time_since_speech_started > eos_timeout):  # The speech period lasted long enough to be significant
+                    
+                    print(f"{bcolors.WARNING}Missing EOS detected: Speech ended {time_since_last_vad:.1f}s ago but no sentence completion. Attempting recovery...{bcolors.ENDC}")
+                    if not recover_recorder():
+                        print(f"{bcolors.FAIL}Could not recover recorder{bcolors.ENDC}")
+                        break
+                    # Reset all activity timers after recovery
+                    last_activity_time = current_time
+                    last_realtime_activity = current_time
+                    last_whisper_response = current_time
+                    last_vad_activity = current_time
+                    vad_speech_detected = False
+                    speech_started_time = 0.0
+                    continue
             
-            # Secondary check: General Whisper unresponsiveness (much longer timeout)
+            # Secondary check: General Whisper unresponsiveness (only if enabled)
             # Only for cases where the system is completely stuck
-            time_since_whisper = current_time - last_whisper_response
-            time_since_full_sentence = current_time - last_activity_time
-            
-            if (time_since_whisper > whisper_responsiveness_timeout and 
-                time_since_full_sentence > whisper_responsiveness_timeout):
-                print(f"{bcolors.WARNING}Whisper appears completely unresponsive (no activity for {time_since_whisper:.1f}s), attempting recovery...{bcolors.ENDC}")
-                if not recover_recorder():
-                    print(f"{bcolors.FAIL}Could not recover recorder{bcolors.ENDC}")
-                    break
-                # Reset all activity timers after recovery
-                last_activity_time = current_time
-                last_realtime_activity = current_time
-                last_whisper_response = current_time
-                last_vad_activity = current_time
-                vad_speech_detected = False
-                speech_started_time = 0.0
-                continue
+            if whisper_responsiveness_timeout > 0:  # Only check if this timeout is enabled
+                time_since_whisper = current_time - last_whisper_response
+                time_since_full_sentence = current_time - last_activity_time
+                
+                if (time_since_whisper > whisper_responsiveness_timeout and 
+                    time_since_full_sentence > whisper_responsiveness_timeout):
+                    print(f"{bcolors.WARNING}Whisper appears completely unresponsive (no activity for {time_since_whisper:.1f}s), attempting recovery...{bcolors.ENDC}")
+                    if not recover_recorder():
+                        print(f"{bcolors.FAIL}Could not recover recorder{bcolors.ENDC}")
+                        break
+                    # Reset all activity timers after recovery
+                    last_activity_time = current_time
+                    last_realtime_activity = current_time
+                    last_whisper_response = current_time
+                    last_vad_activity = current_time
+                    vad_speech_detected = False
+                    speech_started_time = 0.0
+                    continue
             
             # Check for too many consecutive failures
             if consecutive_failures >= max_consecutive_failures:
@@ -809,18 +823,25 @@ def _recorder_thread(loop):
                     break
                 continue
             
-            # Submit transcription task with timeout
+            # Submit transcription task with conditional safety timeout
+            # The EOS timeout logic above handles stuck transcription more intelligently
             future = None
+            safety_timeout = transcription_timeout * 10 if transcription_timeout > 0 else None  # Only use if enabled
             try:
                 future = executor.submit(text_with_timeout)
-                success = future.result(timeout=transcription_timeout)  # Use configurable timeout
+                # Use timeout only if safety timeout is enabled (transcription_timeout > 0)
+                # This timeout is just a safety net for completely frozen processes
+                if safety_timeout is not None:
+                    success = future.result(timeout=safety_timeout)
+                else:
+                    success = future.result()  # No timeout - wait indefinitely
                 
                 if not success:
                     consecutive_failures += 1
                     print(f"{bcolors.WARNING}Transcription failed (failure count: {consecutive_failures}){bcolors.ENDC}")
                     
             except FutureTimeoutError:
-                print(f"{bcolors.WARNING}Transcription timed out after {transcription_timeout} seconds{bcolors.ENDC}")
+                print(f"{bcolors.WARNING}Safety timeout triggered after {safety_timeout} seconds (this indicates a severe system issue){bcolors.ENDC}")
                 consecutive_failures += 1
                 
                 # Cancel the future to prevent resource leaks
@@ -832,7 +853,7 @@ def _recorder_thread(loop):
                 
                 # Force recovery on timeout
                 if not recover_recorder():
-                    print(f"{bcolors.FAIL}Could not recover after timeout{bcolors.ENDC}")
+                    print(f"{bcolors.FAIL}Could not recover after safety timeout{bcolors.ENDC}")
                     break
             
             # Add debug logging for activity tracking
@@ -840,6 +861,8 @@ def _recorder_thread(loop):
                 time_since_realtime = current_time - last_realtime_activity
                 time_since_whisper = current_time - last_whisper_response
                 time_since_full_sentence = current_time - last_activity_time
+                time_since_last_vad = current_time - last_vad_activity
+                time_since_speech_started = current_time - speech_started_time if speech_started_time > 0 else float('inf')
                 print(f"[DEBUG] Activity tracking - EOS timeout: {eos_timeout}s, VAD: {time_since_last_vad:.1f}s ago, Speech started: {time_since_speech_started:.1f}s ago, Currently detecting: {vad_speech_detected}")
                 print(f"[DEBUG] Whisper activity - Realtime: {time_since_realtime:.1f}s, Whisper: {time_since_whisper:.1f}s, Full: {time_since_full_sentence:.1f}s")
             
